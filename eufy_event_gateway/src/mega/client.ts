@@ -316,6 +316,31 @@ export class MegaClient {
   }
 
   /**
+   * Research only: the session identity an NVR signalling join must present.
+   * Callers must never log these values.
+   */
+  researchSignallingIdentity(): { readonly authToken: string; readonly userId: string; readonly gtoken: string } {
+    this.#requireAuthentication();
+    return { authToken: this.#session!.authToken, userId: this.#session!.userId, gtoken: megaUserToken(this.#session!.userId) };
+  }
+
+  /** Research only: fetch the raw NVR signalling token (never log it). */
+  async researchNvrSignToken(stationSerial: string, region: "us" | "eu" | "ie", modelType = "WEB"): Promise<string> {
+    this.#requireAuthentication();
+    const host = region === "us" ? "security-smart.eufylife.com" : `security-smart-${region}.eufylife.com`;
+    const response = await this.#fetch(`https://${host}/v1/smart/nvr/ws/sign?station_sn=${encodeURIComponent(stationSerial)}`, {
+      headers: {
+        "app-name": "eufy_mega", "model-type": modelType, "web-country": this.#country.toUpperCase(),
+        gtoken: megaUserToken(this.#session!.userId), "x-auth-token": this.#session!.authToken, authorization: this.#session!.authToken,
+      },
+      signal: AbortSignal.timeout(30_000),
+    });
+    const value: unknown = JSON.parse(await response.text());
+    if (!isRecord(value) || value.code !== 0 || typeof value.data !== "string") throw new Error(`NVR sign token refused (HTTP ${response.status})`);
+    return value.data;
+  }
+
+  /**
    * Research probe: ask the smart-service for an NVR signalling token using
    * this Mega session. RTC-only stations (T8N00) are reached through a cloud
    * signalling WebSocket whose join requires this per-station token. Returns
@@ -378,7 +403,10 @@ export class MegaClient {
       return;
     }
     const expectedVerifier = credentialVerifier(restored.openUdid, this.#email, this.#password);
-    if (restored.country.toLowerCase() !== this.#country || restored.credentialVerifier !== expectedVerifier) {
+    // Research only (fork branch nvr-s4-research): reuse a session the account owner
+    // created interactively, without holding the password. Never enable in production.
+    const researchSessionOnly = process.env.EUFY_RESEARCH_SESSION_ONLY === "1" && restored.country.toLowerCase() === this.#country;
+    if (!researchSessionOnly && (restored.country.toLowerCase() !== this.#country || restored.credentialVerifier !== expectedVerifier)) {
       this.#session = emptySession(this.#country, restored.openUdid, expectedVerifier);
       return;
     }
