@@ -315,6 +315,43 @@ export class MegaClient {
     return response;
   }
 
+  /**
+   * Research probe: ask the smart-service for an NVR signalling token using
+   * this Mega session. RTC-only stations (T8N00) are reached through a cloud
+   * signalling WebSocket whose join requires this per-station token. Returns
+   * only the result code, message, and token length so callers cannot log it.
+   */
+  async probeNvrSignToken(
+    stationSerial: string,
+    modelType: string,
+    region: "us" | "eu" | "ie",
+  ): Promise<{ readonly httpStatus: number; readonly code: unknown; readonly msg: unknown; readonly tokenLength: number }> {
+    this.#requireAuthentication();
+    const host = region === "us" ? "security-smart.eufylife.com" : `security-smart-${region}.eufylife.com`;
+    const url = `https://${host}/v1/smart/nvr/ws/sign?station_sn=${encodeURIComponent(stationSerial)}`;
+    const response = await this.#fetch(url, {
+      headers: {
+        "app-name": "eufy_mega",
+        "model-type": modelType,
+        "web-country": this.#country.toUpperCase(),
+        gtoken: megaUserToken(this.#session!.userId),
+        "x-auth-token": this.#session!.authToken,
+        authorization: this.#session!.authToken,
+      },
+      signal: AbortSignal.timeout(30_000),
+    });
+    const text = await response.text();
+    let value: unknown;
+    try { value = JSON.parse(text); } catch { value = null; }
+    const record = isRecord(value) ? value : {};
+    return {
+      httpStatus: response.status,
+      code: record.code,
+      msg: typeof record.msg === "string" ? safeMegaMessage(record.msg) : undefined,
+      tokenLength: typeof record.data === "string" ? record.data.length : 0,
+    };
+  }
+
   #mediaHeaders(): Record<string, string> {
     this.#requireAuthentication();
     return {
