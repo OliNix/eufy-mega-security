@@ -921,10 +921,23 @@ export class MegaClient {
     return { authToken: this.#session!.authToken, userId: this.#session!.userId, gtoken: megaUserToken(this.#session!.userId) };
   }
 
-  /** Research only: the raw NVR signalling token (never log it), through the production sign request. */
+  /** Research only: the raw NVR signalling token (never log it). */
   async researchNvrSignToken(stationSerial: string, region: "us" | "eu" | "ie", modelType = "WEB"): Promise<string> {
-    if (modelType !== "WEB") throw new Error("researchNvrSignToken: the production sign request is WEB only; use probeNvrSignToken");
-    return (await this.nvrSignallingContext(stationSerial, region, AbortSignal.timeout(30_000))).sign;
+    // Direct request, as on 0.1.115. Not nvrSignallingContext: that rejects with "cancelled" whenever the
+    // session object is replaced mid-request, which a concurrent research read's key exchange does.
+    this.#requireAuthentication();
+    const session = this.#session!;
+    const host = region === "us" ? "security-smart.eufylife.com" : `security-smart-${region}.eufylife.com`;
+    const response = await this.#fetch(`https://${host}/v1/smart/nvr/ws/sign?station_sn=${encodeURIComponent(stationSerial)}`, {
+      headers: {
+        "app-name": "eufy_mega", "model-type": modelType, "web-country": this.#country.toUpperCase(),
+        gtoken: megaUserToken(session.userId), "x-auth-token": session.authToken, authorization: session.authToken,
+      },
+      redirect: "manual", signal: AbortSignal.timeout(30_000),
+    });
+    const value: unknown = JSON.parse(await response.text());
+    if (!isRecord(value) || value.code !== 0 || typeof value.data !== "string") throw new Error(`NVR sign token refused (HTTP ${response.status})`);
+    return value.data;
   }
 
   /**
