@@ -42,6 +42,7 @@ If you are new to the project, read [`DEVELOPERS_START_HERE.md`](DEVELOPERS_STAR
 | `eufy_event_gateway/src/provider/device-capability-core.ts` | Shared row shape used by each family definition file. |
 | `eufy_event_gateway/src/provider/device-capabilities-core.ts` | Shared evaluator for all camera, sensor, HomeBase, and doorbell core lookups; separates evidence from support without admitting unsupported devices. |
 | `eufy_event_gateway/src/provider/devices/generated-catalogue.ts` | Runtime identity and admission tables generated from the YAML device catalogue. Never edit this file directly. |
+| `eufy_event_gateway/src/provider/nvr-mode-watcher.ts` | Owns one T8N00's opt-in read-only observer loop: a fresh connection per attempt, bounded back-off and clean close. The provider owns admission, credentials and the effective-mode reading. |
 | `eufy_event_gateway/src/provider/simulated-provider.ts` | Deterministic provider for local UI, API, SSE, and lifecycle testing without an Eufy account. |
 
 ### Mega protocol
