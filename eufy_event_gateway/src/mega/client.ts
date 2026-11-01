@@ -407,7 +407,10 @@ export class MegaClient {
       if (this.#session) await this.#store.save(this.#session);
       return { state: "authenticated" };
     }
-
+    // Research only: a session-only run must never reach the account check or login.
+    if (process.env.EUFY_RESEARCH_SESSION_ONLY === "1") {
+      throw new Error("Research session-only run: the saved session is missing, expired or for another country; refusing to sign in");
+    }
 
     // Domain discovery and key exchange happen before login because the
     // regional API host and its signing identity are account-specific.
@@ -909,6 +912,58 @@ export class MegaClient {
     });
   }
 
+  /**
+   * Research only: the session identity an NVR signalling join must present.
+   * Callers must never log these values.
+   */
+  researchSignallingIdentity(): { readonly authToken: string; readonly userId: string; readonly gtoken: string } {
+    this.#requireAuthentication();
+    return { authToken: this.#session!.authToken, userId: this.#session!.userId, gtoken: megaUserToken(this.#session!.userId) };
+  }
+
+  /** Research only: the raw NVR signalling token (never log it), through the production sign request. */
+  async researchNvrSignToken(stationSerial: string, region: "us" | "eu" | "ie", modelType = "WEB"): Promise<string> {
+    if (modelType !== "WEB") throw new Error("researchNvrSignToken: the production sign request is WEB only; use probeNvrSignToken");
+    return (await this.nvrSignallingContext(stationSerial, region, AbortSignal.timeout(30_000))).sign;
+  }
+
+  /**
+   * Research probe: ask the smart-service for an NVR signalling token using
+   * this Mega session. RTC-only stations (T8N00) are reached through a cloud
+   * signalling WebSocket whose join requires this per-station token. Returns
+   * only the result code, message, and token length so callers cannot log it.
+   */
+  async probeNvrSignToken(
+    stationSerial: string,
+    modelType: string,
+    region: "us" | "eu" | "ie",
+  ): Promise<{ readonly httpStatus: number; readonly code: unknown; readonly msg: unknown; readonly tokenLength: number }> {
+    this.#requireAuthentication();
+    const host = region === "us" ? "security-smart.eufylife.com" : `security-smart-${region}.eufylife.com`;
+    const url = `https://${host}/v1/smart/nvr/ws/sign?station_sn=${encodeURIComponent(stationSerial)}`;
+    const response = await this.#fetch(url, {
+      headers: {
+        "app-name": "eufy_mega",
+        "model-type": modelType,
+        "web-country": this.#country.toUpperCase(),
+        gtoken: megaUserToken(this.#session!.userId),
+        "x-auth-token": this.#session!.authToken,
+        authorization: this.#session!.authToken,
+      },
+      signal: AbortSignal.timeout(30_000),
+    });
+    const text = await response.text();
+    let value: unknown;
+    try { value = JSON.parse(text); } catch { value = null; }
+    const record = isRecord(value) ? value : {};
+    return {
+      httpStatus: response.status,
+      code: record.code,
+      msg: typeof record.msg === "string" ? safeMegaMessage(record.msg) : undefined,
+      tokenLength: typeof record.data === "string" ? record.data.length : 0,
+    };
+  }
+
   #mediaHeaders(): Record<string, string> {
     this.#requireAuthentication();
     return {
@@ -935,7 +990,10 @@ export class MegaClient {
       return;
     }
     const expectedVerifier = credentialVerifier(restored.openUdid, this.#email, this.#password);
-    if (restored.country.toLowerCase() !== this.#country || restored.credentialVerifier !== expectedVerifier) {
+    // Research only (fork branch nvr-s4-research-0221): reuse a session the account owner
+    // created interactively, without holding the password. Never enable in production.
+    const researchSessionOnly = process.env.EUFY_RESEARCH_SESSION_ONLY === "1" && restored.country.toLowerCase() === this.#country;
+    if (!researchSessionOnly && (restored.country.toLowerCase() !== this.#country || restored.credentialVerifier !== expectedVerifier)) {
       this.#session = emptySession(this.#country, restored.openUdid, expectedVerifier);
       if (restored.generalRtcIdentity) {
         await this.#store.save(nativeOnlySession(restored));
