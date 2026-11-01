@@ -38,6 +38,9 @@ export interface GatewayConfig {
   /** Separate default-off physical NVR control trials, each requiring explicit observation consent. */
   readonly experimentalNvrControls: boolean;
 
+  /** Default-off standing read-only T8N00 effective-mode observer, without media or commands. */
+  readonly experimentalNvrModeWatch: boolean;
+
   /** Default-off native standalone doorbell video test, requiring private-media consent. */
   readonly experimentalDoorbellRtc: boolean;
 
@@ -88,6 +91,9 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Gatewa
   const experimentalNvrControls = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_NVR_CONTROLS, "EUFY_GATEWAY_EXPERIMENTAL_NVR_CONTROLS");
   if (experimentalNvrControls && !apiToken) throw new Error("Experimental NVR controls require EUFY_GATEWAY_API_TOKEN");
   const experimentalNvrLive = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_NVR_LIVE, "EUFY_GATEWAY_EXPERIMENTAL_NVR_LIVE");
+
+  // The observer carries no video and adds no endpoint, so it needs neither the video option nor a token.
+  const experimentalNvrModeWatch = captureBoolean(environment.EUFY_GATEWAY_EXPERIMENTAL_NVR_MODE_WATCH, "EUFY_GATEWAY_EXPERIMENTAL_NVR_MODE_WATCH");
   const experimentalFixedH265Resolution = captureBoolean(
     environment.EUFY_GATEWAY_EXPERIMENTAL_FIXED_H265_RESOLUTION,
     "EUFY_GATEWAY_EXPERIMENTAL_FIXED_H265_RESOLUTION",
@@ -119,6 +125,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Gatewa
     experimentalE30Locks,
     experimentalNvrLive,
     experimentalNvrControls,
+    experimentalNvrModeWatch,
     experimentalDoorbellRtc,
     experimentalGeneralRtc,
     experimentalCloudRecordings,

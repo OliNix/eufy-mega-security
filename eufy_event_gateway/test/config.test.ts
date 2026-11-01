@@ -5,6 +5,7 @@
  * the rule that a non-loopback HTTP listener requires a strong API token.
  */
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { loadConfig } from "../src/config.js";
@@ -104,6 +105,20 @@ test("cloud recording trial is default-off and requires a token with strict flag
   assert.equal(loadConfig({ EUFY_GATEWAY_EXPERIMENTAL_CLOUD_RECORDINGS: "true", EUFY_GATEWAY_API_TOKEN: "x".repeat(32) }).experimentalCloudRecordings, true);
 });
 
+
+test("the NVR mode watcher is default-off, strictly parsed and independent of video and tokens", async () => {
+  assert.equal(loadConfig({}).experimentalNvrModeWatch, false);
+  assert.throws(() => loadConfig({ EUFY_GATEWAY_EXPERIMENTAL_NVR_MODE_WATCH: "yes" }), /must be true or false/);
+  const enabled = loadConfig({ EUFY_GATEWAY_EXPERIMENTAL_NVR_MODE_WATCH: "true" });
+  assert.equal(enabled.experimentalNvrModeWatch, true);
+  assert.equal(enabled.experimentalNvrLive, false);
+  const root = new URL("../", import.meta.url);
+  const app = await readFile(new URL("config.yaml", root), "utf8");
+  assert.match(app, /^  experimental_nvr_mode_watch: false$/m);
+  assert.match(app, /^  experimental_nvr_mode_watch: bool\?$/m);
+  assert.match(await readFile(new URL("run.sh", root), "utf8"), /export EUFY_GATEWAY_EXPERIMENTAL_NVR_MODE_WATCH=.*experimental_nvr_mode_watch \/\/ false/);
+  assert.match(await readFile(new URL("translations/en.yaml", root), "utf8"), /experimental_nvr_mode_watch:\n    name: .+\n    description: .*Read-only.*Off by default\./);
+});
 
 test("NVR camera-power trials need a separate default-off authenticated option",()=>{
   assert.equal(loadConfig({}).experimentalNvrControls,false);

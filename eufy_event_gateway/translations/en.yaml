@@ -17,6 +17,9 @@ configuration:
   experimental_nvr_live:
     name: Experimental NVR video test
     description: Enable a consented ten-second private video test in Diagnostics for T8E00 cameras through T8N00 or T9000. Hardware behaviour is unconfirmed. Off by default.
+  experimental_nvr_mode_watch:
+    name: Experimental NVR mode watcher
+    description: Keep a video-free connection to each T8N00 so the effective mode sensor follows mode changes made in the app or by the schedule. Read-only. It sends no command and starts no video. The reading stays unknown until the first change after each connection. Hardware behaviour is unconfirmed. Off by default.
   experimental_nvr_region:
     name: Experimental video service region
     description: Select auto, us, eu or ie. GB-style accounts may require ie even when auto selects eu. This is a service region, not the account country.

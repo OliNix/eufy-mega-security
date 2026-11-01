@@ -77,6 +77,7 @@ if (config.provider === "simulated") {
     experimentalNvrLive: config.experimentalNvrLive,
     experimentalNvrControls: config.experimentalNvrControls,
     normalNvrLive: config.experimentalNvrLive,
+    nvrModeWatch: config.experimentalNvrModeWatch,
     apiAuthenticationConfigured: !!config.apiToken,
     experimentalDoorbellRtc: config.experimentalDoorbellRtc,
     experimentalGeneralRtc: config.experimentalGeneralRtc,
