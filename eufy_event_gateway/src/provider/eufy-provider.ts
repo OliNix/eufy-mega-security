@@ -3896,7 +3896,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
     try { this.#events?.eventReceiverState("stopped"); } catch {}
     for (const value of this.#nvrSettings.values()) if (value.timer) clearTimeout(value.timer);
     this.#nvrSettings.clear(); this.#nvrViews.clear(); this.#nvrExplicitOwners.clear();
-    await this.#retireNvrModeWatchers(); current();
+    if (this.#nvrModeWatchers.size) { await this.#retireNvrModeWatchers(); current(); }
     await Promise.allSettled([...this.#nvrTrials.values()].map(trial => trial.release())); current();
     await Promise.allSettled([...this.#doorbellTrials.values()].map(trial => trial.release())); current();
     if (this.#generalRtcTrials.size) {
@@ -5113,19 +5113,21 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
   }
 
   /**
-   * Reconcile observers with this generation's inventory. Watchers from an older
-   * generation or for a changed or withdrawn station close; each admitted T8N00
-   * without one gets one. Startup and inventory refresh call this after publishing.
+   * Reconcile observers with the current generation's inventory. A late call
+   * from a retired generation changes nothing; startup completion has already
+   * retired that generation's watchers. Watchers for a changed or no longer
+   * admitted station close, and each admitted T8N00 without one gets one.
+   * Startup and inventory refresh call this after publishing station state.
    */
   #syncNvrModeWatchers(generation: number): void {
+    if (generation !== this.#startupGeneration) return;
     for (const [serial, owned] of this.#nvrModeWatchers) {
       const station = this.#devices.get(serial);
-      if (owned.generation === generation && generation === this.#startupGeneration && this.#nvrModeWatchAdmitted(station)
+      if (owned.generation === generation && this.#nvrModeWatchAdmitted(station)
         && !inventoryBindingChanged(owned.station, station)) continue;
       this.#nvrModeWatchers.delete(serial);
       void owned.watcher.close();
     }
-    if (generation !== this.#startupGeneration) return;
     for (const station of this.#devices.values()) {
       if (!this.#nvrModeWatchAdmitted(station) || this.#nvrModeWatchers.has(station.serial)) continue;
       const serial = station.serial;
