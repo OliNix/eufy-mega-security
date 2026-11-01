@@ -2,6 +2,7 @@
  * Owns one provider-admitted NVR RTC connection from join through bounded close.
  * Normal live view renews its lease through checked video output. Diagnostics
  * and separately admitted security trials retain a finite total lifetime.
+ * A read-only observer holds the data channel without media or commands.
  * The provider owns the station lease and supplies private Mega credentials.
  * Checked video reaches the media boundary. Normal opt-in controls and separately
  * consented guard/power trials retain distinct admission and request ownership.
@@ -20,7 +21,7 @@ import { NvrPowerError, type NvrCameraPower } from "../provider/nvr-power-trial.
 import { NvrGuardError } from "../provider/nvr-guard-trial.js";
 import type { NvrGuardEffective } from "../provider/nvr-guard-schedule.js";
 import { NvrTrialError, nvrCameraPowerCommand, nvrGuardModeCommand, nvrApplication, nvrCandidate, nvrCommand, nvrHeartbeat, nvrJson,
-  nvrMatchCamera, nvrNetworkHost, nvrOffer, nvrPackets, nvrRecord, nvrVideo, nvrStateSummary, type NvrStateSummary, type NvrTrialStage, type NvrTrialReason } from "./nvr-protocol.js";
+  nvrDeviceList, nvrMatchCamera, nvrNetworkHost, nvrOffer, nvrPackets, nvrRecord, nvrVideo, nvrStateSummary, type NvrStateSummary, type NvrTrialStage, type NvrTrialReason } from "./nvr-protocol.js";
 
 import { NvrLiveControlError } from "../provider/nvr-live-controls.js";
 import { nvrEffectiveModeBroadcast, type NvrEffectiveModeObservation } from "./nvr-effective-mode.js";
@@ -88,6 +89,14 @@ export interface NvrRtcOptions {
    * inferred and no query, polling or independent observer session is started.
    */
   readonly onEffectiveMode?: (observation: NvrEffectiveModeObservation | null) => void;
+
+  /**
+   * Station-wide read-only observer admission, never combined with media,
+   * controls or trials. After join it sends heartbeats and one device list only,
+   * so it binds no camera: camera and channel are unused. It has no finite
+   * lifetime and survives Eufy's routine signalling close once that list is accepted.
+   */
+  readonly observer?: boolean;
   readonly station: string;
   readonly camera: string;
   readonly channel: number;
@@ -160,6 +169,9 @@ export interface NvrRtcStats {
 
   /** Signalling sockets retired after a normal viewer had valid video. */
   signallingClosuresAfterVideo: number;
+
+  /** Signalling sockets retired after an observer's device list was accepted. */
+  signallingClosuresWhileObserving: number;
   stopUnconfirmed: number;
   channel0Frames: number;
   channel1Frames: number;
@@ -185,7 +197,7 @@ export class NvrRtcSession {
   readonly output = new PassThrough({ highWaterMark: 4 * 1024 * 1024 + 64 });
   readonly stats: NvrRtcStats = { packets: 0, frames: 0, video: 0, controlPackets: 0, rejected: 0,
     segmentNotEchoed: 0, staleReplies: 0, ignoredAudio: 0, ignoredUnknownMedia: 0,
-    applicationSequenceRecoveries: 0, videoSequenceRecoveries: 0, signallingClosuresAfterVideo: 0, stopUnconfirmed: 0,
+    applicationSequenceRecoveries: 0, videoSequenceRecoveries: 0, signallingClosuresAfterVideo: 0, signallingClosuresWhileObserving: 0, stopUnconfirmed: 0,
     channel0Frames: 0, channel1Frames: 0, channel2Frames: 0, channel3Frames: 0, channel4Frames: 0, channel5Frames: 0 };
   readonly #abort = new AbortController();
   readonly #negotiation = new AbortController();
@@ -232,6 +244,9 @@ export class NvrRtcSession {
   #stage: NvrTrialStage = "join";
   #closing: Promise<void> | null = null;
   #retired = false;
+  #observing = false;
+  #failure: NvrTrialError | null = null;
+  readonly #closed = Promise.withResolvers<NvrTrialError | null>();
   #channelFailureScheduled = false;
   #started = false;
   #startSent = false;
@@ -266,10 +281,18 @@ export class NvrRtcSession {
     if (this.#maximumLifetimeMilliseconds === null ? options.powerTrial || options.guardTrial
       : !Number.isSafeInteger(this.#maximumLifetimeMilliseconds) || this.#maximumLifetimeMilliseconds < 1_000
         || this.#maximumLifetimeMilliseconds > 2_147_483_647) throw new NvrTrialError("admission");
+    if (options.observer && (this.#maximumLifetimeMilliseconds !== null || options.liveControls || options.powerTrial
+      || options.guardTrial)) throw new NvrTrialError("admission");
     this.#externalAbort = () => this.#fail("cancelled");
     options.signal.addEventListener("abort", this.#externalAbort, { once: true });
     this.output.on("error", () => {});
   }
+
+  /**
+   * Settles once after retirement with the failure that ended this connection,
+   * or null when its owner closed it. It never rejects.
+   */
+  get closed(): Promise<NvrTrialError | null> { return this.#closed.promise; }
 
   /** Report only a checked codec, never a model-derived guess. */
   get codec(): VideoCodec | null { return this.#codec; }
@@ -299,6 +322,7 @@ export class NvrRtcSession {
 
   /** Negotiate, correlate fresh discovery, attach the sink, and request video once. */
   async start(): Promise<void> {
+    if (this.options.observer) throw new NvrTrialError("admission");
     if (this.options.powerTrial || this.options.guardTrial) throw this.options.guardTrial
       ? new NvrGuardError("admission") : new NvrPowerError("admission");
     this.#startInvoked = true;
@@ -312,6 +336,17 @@ export class NvrRtcSession {
       if (this.#maximumLifetimeMilliseconds === null) this.#videoProgressExpiresAt = (this.options.videoProgressNow?.() ?? performance.now()) + 20_000;
       this.#firstFrame = setTimeout(() => this.#fail("video"), 20_000);
     }
+  }
+
+  /**
+   * Join and accept one station device list, then hold the data channel.
+   * Resolves when observing begins. Only heartbeats keep it open afterwards, and
+   * mode broadcasts reach onEffectiveMode until close or failure settles `closed`.
+   */
+  async observe(): Promise<void> {
+    if (!this.options.observer) throw new NvrTrialError("admission");
+    await this.#connectAndDiscover();
+    this.#observing = true;
   }
 
   /**
@@ -625,7 +660,8 @@ export class NvrRtcSession {
     } finally { clearTimeout(timer); }
     this.#stage = "inventory";
     const discovery = await this.#request(9100, 5000);
-    nvrMatchCamera(discovery, this.options.camera, this.options.channel, this.options.cameraType ?? 301);
+    if (this.options.observer) nvrDeviceList(discovery);
+    else nvrMatchCamera(discovery, this.options.camera, this.options.channel, this.options.cameraType ?? 301);
     this.#guard();
   }
 
@@ -680,6 +716,7 @@ export class NvrRtcSession {
       this.#pendingCandidates.length = 0; this.#localCandidates.clear(); this.#turn.length = 0;
       this.output.end();
     })();
+    void this.#closing.finally(() => this.#closed.resolve(this.#failure)).catch(() => {});
     return this.#closing;
   }
 
@@ -687,11 +724,17 @@ export class NvrRtcSession {
     if (this.#retired || this.options.signal.aborted || !this.options.current()) throw new NvrTrialError("cancelled");
   }
 
+  /**
+   * Eufy closes the signalling socket about two minutes after join while the
+   * peer connection carries on. Only an established viewer or observer may lose
+   * it; setup still fails closed. The peer and data channel own later failures.
+   */
   #canRetireSignalling(): boolean {
-    if (this.#maximumLifetimeMilliseconds !== null || !this.#startSent || !this.#bootstrapped) return false;
+    if (this.#maximumLifetimeMilliseconds !== null || !(this.#observing || this.#startSent && this.#bootstrapped)) return false;
     if (!this.#signallingUnavailable) {
       this.#signallingUnavailable = true;
-      this.stats.signallingClosuresAfterVideo++;
+      if (this.#observing) this.stats.signallingClosuresWhileObserving++;
+      else this.stats.signallingClosuresAfterVideo++;
     }
     return true;
   }
@@ -700,6 +743,7 @@ export class NvrRtcSession {
     if (this.#retired) return;
     this.#stage = stage;
     const error = new NvrTrialError(stage, reason);
+    this.#failure = error;
     this.#readyReject?.(error);
     this.#livePending?.reject(new NvrLiveControlError("outcome_unknown", "dispatch"));
     this.#pending?.reject(error);
@@ -1011,6 +1055,9 @@ export class NvrRtcSession {
 
   #request(command: 9100 | 1003 | 1004 | 1103, timeout: number, closing = false, strict = false): Promise<Record<string, unknown>> {
     if (!closing) this.#guard();
+
+    // An observer's only request is its device list, whatever its caller asks.
+    if (this.options.observer && command !== 9100) return Promise.reject(new NvrTrialError("admission"));
     if (this.#pending || this.#livePending || this.#segment >= 254 || this.options.liveControls && command !== 1004 && this.#segment >= 252) return Promise.reject(new NvrTrialError(this.#stage));
     const channel = this.#channels.get("WebrtcDataChannel");
     if (!channel || channel.readyState !== "open" || channel.bufferedAmount > 1024 * 1024) return Promise.reject(new NvrTrialError("channel"));

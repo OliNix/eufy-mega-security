@@ -253,6 +253,20 @@ export function nvrVideo(frame: NvrApplicationFrame, channel: number): NvrVideoF
   return { codec: body[5] === 1 ? "h265" : "h264", sequence: body.readUInt16LE(6), timestamp: body.readBigUInt64LE(14), bytes };
 }
 
+/**
+ * Accept a bounded station device list without binding a camera. The read-only
+ * observer uses this reply only to prove that the data channel reaches an
+ * answering NVR; signalling has already bound the station serial. Returns the row count.
+ */
+export function nvrDeviceList(response: Record<string, unknown>): number {
+  const payload = nvrRecord(response.payload) ? response.payload : null;
+  if (!payload || !Array.isArray(payload.dev_list) || payload.dev_list.length > 256
+    || !payload.dev_list.every(row => nvrRecord(row) && typeof row.sn === "string" && Number.isInteger(row.ch))) {
+    throw new NvrTrialError("identity_field_missing");
+  }
+  return payload.dev_list.length;
+}
+
 /** Fresh discovery must bind the selected serial, channel and exact camera type. */
 export function nvrMatchCamera(response: Record<string, unknown>, serial: string, channel: number, deviceType = 301): void {
   const payload = nvrRecord(response.payload) ? response.payload : null;
