@@ -34,7 +34,7 @@ import { E30LockProvider } from "./e30-lock-provider.js";
 import { E30LockError } from "./e30-lock-protocol.js";
 import { careMonitorPushKind, careMonitorSensorState } from "./care-monitor.js";
 import { E21ControlError, e21Readings, e21PreferenceContracts, e21PreferenceNames, isE21, validateE21Preference, type E21Readings } from "./e21-profile.js";
-import { NvrRtcSession } from "../stream/nvr-rtc-session.js";
+import { NvrRtcSession, type NvrSwitchTarget } from "../stream/nvr-rtc-session.js";
 import { NvrTrialError, nvrTrialSensor, type NvrStateSummary } from "../stream/nvr-protocol.js";
 import { modelControlTrialActions, parseModelControlTrial, runModelControlTrial, type ModelControlRoute, type ModelControlTrial, type ModelControlTrialAdmission, type ModelControlTrialFailureStage, type ModelControlTrialResult, type AlarmStateTrialResult } from "./model-control-trials.js";
 import { join } from "node:path";
@@ -631,6 +631,14 @@ export interface PpcsStreamRoute {
   readonly homeBaseAttached: boolean;
 }
 
+/** One NVR call and the camera it currently serves. */
+interface NvrTrialEntry {
+  controller: AbortController; device: MegaInventoryDevice; station: MegaInventoryDevice; stateOnly: boolean; diagnostic: boolean;
+  generation: number; sensor: 0 | 1; connecting: boolean; retiring: boolean; terminalRetirement: boolean; sourceReported: boolean;
+  startOwner: { promise: Promise<void>; cancelled: boolean } | undefined; session: NvrRtcSession | null;
+  retireStart: () => void; releasePeer: () => void; release: () => Promise<void>;
+}
+
 /** One private manual sign-in owner; raw lock rows never leave the provider boundary. */
 interface RtcPreparationOwner {
   readonly epoch: number;
@@ -681,11 +689,8 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
   readonly #nvrReadIntervals = new Map<string, number>();
   readonly #nvrViews = new Map<string, { binding: string; value: 0 | 1 }>();
   readonly #nvrSettings = new Map<string, { binding: string; values: NvrLiveSettings; nightAt: number; qualityAt: number; trackingAt: number; timer: NodeJS.Timeout | null }>();
-  #nvrMediaChecks: { viewer: (serial: string) => boolean; active: (serial: string) => boolean; recording: (serial: string) => boolean } | null = null;
-  readonly #nvrTrials = new Map<string, { controller: AbortController; device: MegaInventoryDevice;
-    station: MegaInventoryDevice; stateOnly: boolean; diagnostic: boolean; generation: number; sensor: 0 | 1; connecting: boolean; retiring: boolean; terminalRetirement: boolean;
-    sourceReported: boolean; startOwner: { promise: Promise<void>; cancelled: boolean } | undefined;
-    session: NvrRtcSession | null; retireStart: () => void; release: () => Promise<void> }>();
+  #nvrMediaChecks: { viewer: (serial: string) => boolean; active: (serial: string) => boolean; recording: (serial: string) => boolean; yieldable: (serial: string) => boolean } | null = null;
+  readonly #nvrTrials = new Map<string, NvrTrialEntry>();
 
   /** Private card references expire in memory and are never published as filesystem paths. */
   readonly #recordingReferences = new Map<string, { serial: string; record: CameraStoredRecord; expiresAt: number }>();
@@ -1856,16 +1861,30 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
     return this.#reserveNvrTrial(serial, signal, false, true);
   }
 
-  #reserveNvrTrial(serial: string, signal: AbortSignal, stateOnly: boolean, diagnostic: boolean): () => Promise<void> {
+  /**
+   * Find the call a new view may move to this camera. Only a normal NVR view
+   * that is idle or merely watched gives way, and nothing else may be using the
+   * NVR. HomeBase routes have no such call.
+   */
+  #nvrCallToTake(device: MegaInventoryDevice, station: MegaInventoryDevice): NvrTrialEntry | null {
+    const rows = [...this.#nvrTrials];
+    if (rows.length !== 1 || station.model !== "T8N00" || station.deviceType !== 300 || this.#localMotionAborters.size
+      || [...this.#recordingReservations].some(camera => this.#devices.get(camera)?.parentSerial === station.serial)) return null;
+    const [serial, entry] = rows[0]!;
+    return serial !== device.serial && entry.station.serial === station.serial && !entry.diagnostic && !entry.stateOnly && !entry.retiring
+      && entry.generation === this.#startupGeneration && entry.session?.switchable && this.#nvrMediaChecks?.yieldable(serial) ? entry : null;
+  }
+
+  #reserveNvrTrial(serial: string, signal: AbortSignal, stateOnly: boolean, diagnostic: boolean, handover: NvrTrialEntry | null = null): () => Promise<void> {
     const device = this.#devices.get(serial), station = device ? this.#devices.get(device.parentSerial) : undefined;
     if (!this.config.experimentalNvrLive || this.#recordingClosing || signal.aborted || !this.#client.isAuthenticated
-      || this.#localMotionAborters.size || this.#nvrTrials.size || !device || !station || this.#nvrControlReserved(station.serial) || !(diagnostic ? this.#nvrBinding(device, station) : this.#normalNvrLiveBinding(device, station)) || this.#recordingPeerReserved(serial) || this.#stationHasActiveMedia(station.serial)) throw new NvrTrialError("admission");
+      || this.#localMotionAborters.size || !handover && this.#nvrTrials.size || !device || !station || this.#nvrControlReserved(station.serial) || !(diagnostic ? this.#nvrBinding(device, station) : this.#normalNvrLiveBinding(device, station)) || !handover && (this.#recordingPeerReserved(serial) || this.#stationHasActiveMedia(station.serial))) throw new NvrTrialError("admission");
     const controller = new AbortController();
     let closed: Promise<void> | null = null;
     const deadline = diagnostic
       ? setTimeout(() => { controller.abort(); void entry.session?.close().catch(() => {}); }, 85_000)
       : null;
-    const entry = { controller, device, station, stateOnly, diagnostic, generation: this.#startupGeneration,
+    const entry: NvrTrialEntry = { controller, device, station, stateOnly, diagnostic, generation: this.#startupGeneration,
       sensor: diagnostic ? nvrTrialSensor(device.model, device.deviceType)! : this.#nvrView(device), connecting: false, retiring: false, terminalRetirement: false,
       sourceReported: false, startOwner: this.#streamStarts.get(serial), retireStart: (): void => {
         entry.terminalRetirement = true;
@@ -1877,7 +1896,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
           entry.startOwner.cancelled = true;
         }
       },
-      session: null as NvrRtcSession | null, release: (): Promise<void> => {
+      session: null, releasePeer: (): void => {}, release: (): Promise<void> => {
       if (closed) return closed;
       entry.retiring = true;
 
@@ -1892,7 +1911,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
           signal.removeEventListener("abort", abort);
           const owned = this.#nvrTrials.get(serial) === entry;
           if (owned) this.#nvrTrials.delete(serial);
-          releaseTrialPeer();
+          entry.releasePeer();
           const waiting = this.#streamStarts.get(serial);
 
           // The manager already observed the terminal source. Its replacement
@@ -1906,14 +1925,14 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
     } };
     const abort = (): void => { controller.abort(); void entry.session?.close().catch(() => {}); };
     signal.addEventListener("abort", abort, { once: true });
-    const releaseTrialPeer = this.#reserveTrialPeer(station.serial); this.#nvrTrials.set(serial, entry);
+    if (handover) { entry.releasePeer = handover.releasePeer; handover.releasePeer = () => {}; }
+    else entry.releasePeer = this.#reserveTrialPeer(station.serial);
+    this.#nvrTrials.set(serial, entry);
     return entry.release;
   }
 
-  async #nvrTrialSession(serial: string): Promise<NvrRtcSession> {
-    const entry = this.#nvrTrials.get(serial)!;
-    if (entry.connecting || entry.session || entry.controller.signal.aborted) throw new NvrTrialError("cancelled");
-    entry.connecting = true;
+  /** Everything that binds a call to this entry's camera, for a new call or one moved here. */
+  #nvrSessionBinding(serial: string, entry: NvrTrialEntry): NvrSwitchTarget {
     const current = (): boolean => {
       const device = this.#devices.get(serial), station = this.#devices.get(entry.station.serial);
       return this.#nvrTrials.get(serial) === entry && entry.generation === this.#startupGeneration
@@ -1921,6 +1940,31 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
         && !!device && !!station && (entry.diagnostic ? this.#nvrBinding(device, station) : this.#normalNvrLiveBinding(device, station)) && !inventoryBindingChanged(entry.device, device)
         && station.deviceType === entry.station.deviceType && station.model === entry.station.model && station.adminUserId === entry.station.adminUserId;
     };
+    return { camera: serial, channel: entry.device.channel!,
+      cameraType: entry.device.deviceType!, sensor: entry.sensor,
+      liveControls: !entry.diagnostic && this.#nvrLiveAdmitted(entry.device, entry.station),
+      panReceiptOnly: nvrLiveProfile(entry.device.model, entry.device.deviceType)?.panReceiptOnly === true,
+      signal: entry.controller.signal, current,
+      ...(!entry.diagnostic && !entry.stateOnly && entry.station.model === "T8N00" && entry.station.deviceType === 300 ? {
+        onEffectiveMode: (observation: NvrEffectiveModeObservation | null): void => {
+          if (entry.session) this.#publishNvrMode(entry.station.serial, entry.session, observation, current);
+        },
+      } : {}),
+      ...(!entry.stateOnly ? { onTimings: (timings: import("../stream/nvr-rtc-session.js").NvrTimings): void => {
+        const model = safeLogModel(entry.device.model);
+        logger.info("nvr_live_timings", `model=${model} offer_ms=${timings.offer ?? "none"} first_local_candidate_ms=${timings.firstLocalCandidate ?? "none"} answer_sent_ms=${timings.answerSent ?? "none"} channel_open_ms=${timings.channelOpen ?? "none"} media_request_ms=${timings.mediaRequest ?? "none"} first_video_ms=${timings.firstVideo ?? "none"}`);
+      } } : {}),
+      ready: (output, codec) => {
+        entry.sourceReported = true;
+        this.#events?.streamStarted(serial, output, codec);
+      } };
+  }
+
+  async #nvrTrialSession(serial: string): Promise<NvrRtcSession> {
+    const entry = this.#nvrTrials.get(serial)!;
+    if (entry.connecting || entry.session || entry.controller.signal.aborted) throw new NvrTrialError("cancelled");
+    entry.connecting = true;
+    const binding = this.#nvrSessionBinding(serial, entry);
     let phaseAbort: (() => void) | undefined;
     try {
       const context = await Promise.race([
@@ -1928,37 +1972,32 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
         new Promise<never>((_, reject) => { phaseAbort = () => reject(new NvrTrialError("cancelled"));
           entry.controller.signal.addEventListener("abort", phaseAbort, { once: true }); }),
       ]);
-      if (!current()) throw new NvrTrialError("cancelled");
-      const session = new NvrRtcSession({ station: entry.station.serial, camera: serial, channel: entry.device.channel!,
-        cameraType: entry.device.deviceType!, sensor: entry.sensor,
-        liveControls: !entry.diagnostic && this.#nvrLiveAdmitted(entry.device, entry.station),
+      if (!binding.current()) throw new NvrTrialError("cancelled");
+      const session = new NvrRtcSession({ ...binding, station: entry.station.serial,
         ...(!entry.diagnostic && !entry.stateOnly && entry.sensor === 0 && entry.device.model === "T8172" && entry.device.deviceType === 89
           && entry.station.model === "T9000" && entry.station.deviceType === 27 ? { s1FirstPictureGrace: true } : {}),
-        panReceiptOnly: nvrLiveProfile(entry.device.model, entry.device.deviceType)?.panReceiptOnly === true,
-        administrator: entry.station.adminUserId!, context, signal: entry.controller.signal, current,
-        maximumLifetimeMilliseconds: entry.diagnostic ? 75_000 : entry.stateOnly ? this.config.maxStreamSeconds * 1_000 : null,
-        ...(!entry.diagnostic && !entry.stateOnly && entry.station.model === "T8N00" && entry.station.deviceType === 300 ? {
-          onEffectiveMode: (observation: NvrEffectiveModeObservation | null): void => {
-            if (entry.session) this.#publishNvrMode(entry.station.serial, entry.session, observation, current);
-          },
-        } : {}),
-        ...(!entry.stateOnly ? { onTimings: (timings: import("../stream/nvr-rtc-session.js").NvrTimings): void => {
-          const model = safeLogModel(entry.device.model);
-          logger.info("nvr_live_timings", `model=${model} offer_ms=${timings.offer ?? "none"} first_local_candidate_ms=${timings.firstLocalCandidate ?? "none"} answer_sent_ms=${timings.answerSent ?? "none"} channel_open_ms=${timings.channelOpen ?? "none"} media_request_ms=${timings.mediaRequest ?? "none"} first_video_ms=${timings.firstVideo ?? "none"}`);
-        } } : {}),
-        ready: (output, codec) => {
-          entry.sourceReported = true;
-          this.#events?.streamStarted(serial, output, codec);
-        } });
+        administrator: entry.station.adminUserId!, context,
+        maximumLifetimeMilliseconds: entry.diagnostic ? 75_000 : entry.stateOnly ? this.config.maxStreamSeconds * 1_000 : null });
       entry.session = session;
       return session;
     } finally { if (phaseAbort) entry.controller.signal.removeEventListener("abort", phaseAbort); }
   }
 
-  async #startNvrTrial(serial: string): Promise<void> {
+  /**
+   * Start this entry's source on a new call, or on the call of the view it
+   * replaces. That view's source ends as the call moves. A failed move closes
+   * the call and opens a fresh one, so the new viewer still gets a picture.
+   */
+  async #startNvrTrial(serial: string, handover: NvrTrialEntry | null = null): Promise<void> {
     const entry = this.#nvrTrials.get(serial)!;
+    let moved: Promise<number> | null = null;
     try {
-      const session = await this.#nvrTrialSession(serial);
+      let session: NvrRtcSession;
+      if (handover) {
+        session = entry.session = handover.session!;
+        handover.session = null;
+        moved = session.switchCamera(this.#nvrSessionBinding(serial, entry));
+      } else session = await this.#nvrTrialSession(serial);
       let terminalHandled = false;
       const retire = (): void => {
         if (terminalHandled || entry.retiring) return;
@@ -1984,7 +2023,8 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
         // PassThrough finishes even when no reader consumes its readable side.
         session.output.once("finish", retire);
       }
-      await session.start();
+      if (moved) logger.info("nvr_live_camera_switched", `model=${safeLogModel(entry.device.model)} first_video_ms=${await moved}`);
+      else await session.start();
       if (!entry.diagnostic && this.#nvrLiveAdmitted(entry.device, entry.station)) {
         void session.initialLiveSettings().then(values => {
           if (this.#nvrTrials.get(serial) === entry && !entry.retiring && !entry.controller.signal.aborted) this.#publishNvrSettings(entry.device, values);
@@ -1993,6 +2033,13 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
     }
     catch (error) {
       const failure = error instanceof NvrTrialError ? error : new NvrTrialError("sign");
+      if (moved && failure.stage !== "cancelled" && !entry.controller.signal.aborted) {
+        logger.warn("nvr_live_switch_failed", `stage=${failure.stage} reason=${failure.reason} ${nvrTrialCounters(entry.session!)}`);
+        entry.retireStart();
+        await entry.release();
+        this.#reserveNvrTrial(serial, new AbortController().signal, false, false);
+        return this.#startNvrTrial(serial);
+      }
       logger.warn(entry.diagnostic ? "nvr_live_trial_failed" : "nvr_live_stream_failed",
         `stage=${failure.stage} reason=${failure.reason}${entry.session ? " " + nvrTrialCounters(entry.session) : ""}`);
       if (!entry.diagnostic && !entry.stateOnly && entry.sourceReported) entry.retireStart();
@@ -2369,7 +2416,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
    * Stop cancels that wait without waking a peer after the control has retired.
    * Control waits and lookup retries retain their existing bounded deadlines.
    */
-  async startStream(serial: string): Promise<void> {
+  async startStream(serial: string, takeOver = false): Promise<void> {
     this.#assertRtcPreparationIdle();
     const nvrStartingDevice = this.#devices.get(serial);
     if (nvrStartingDevice && this.#nvrLiveJobs.has(nvrStartingDevice.parentSerial)) throw new NvrLiveControlError("busy");
@@ -2464,8 +2511,9 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
       const nvrStation = nvrDevice ? this.#devices.get(nvrDevice.parentSerial) : undefined;
       if (nvrStation && this.#nvrControlReserved(nvrStation.serial)) throw new NvrTrialError("admission");
       if (nvrDevice && this.#normalNvrLiveBinding(nvrDevice, nvrStation)) {
-        this.#reserveNvrTrial(serial, new AbortController().signal, false, false);
-        return this.#startNvrTrial(serial);
+        const handover = takeOver ? this.#nvrCallToTake(nvrDevice, nvrStation!) : null;
+        this.#reserveNvrTrial(serial, new AbortController().signal, false, false, handover);
+        return this.#startNvrTrial(serial, handover);
       }
       for (let attempt = 0; ; attempt++) {
         current();
@@ -2499,7 +2547,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
   }
 
   /** Install read-only media facts. The manager remains the sole owner of sources and viewers. */
-  setNvrLiveMediaChecks(checks: { viewer: (serial: string) => boolean; active: (serial: string) => boolean; recording: (serial: string) => boolean }): void {
+  setNvrLiveMediaChecks(checks: { viewer: (serial: string) => boolean; active: (serial: string) => boolean; recording: (serial: string) => boolean; yieldable: (serial: string) => boolean }): void {
     this.#nvrMediaChecks = checks;
   }
 
