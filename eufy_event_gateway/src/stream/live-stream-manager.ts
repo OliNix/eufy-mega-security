@@ -12,6 +12,7 @@
 import { spawn, type ChildProcessWithoutNullStreams, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
+import { setPriority } from "node:os";
 import { type Readable, type Writable } from "node:stream";
 
 import type { DiagnosticMedia } from "../diagnostics/bundle-capture.js";
@@ -1767,15 +1768,29 @@ export function h265ViewerTranscoderArguments(fixedResolution = false): string[]
 
 /** Start the shared low-latency fallback used only when a camera returns H.265. */
 export function spawnH265ViewerTranscoder(fixedResolution = false): ChildProcessWithoutNullStreams {
-  return spawn("ffmpeg", h265ViewerTranscoderArguments(fixedResolution));
+  return yieldToGateway(spawn("ffmpeg", h265ViewerTranscoderArguments(fixedResolution)));
+}
+
+/**
+ * Conversion can fill every core of a small host, and live video reaches the
+ * gateway through JavaScript on one thread. Keep that thread ahead of FFmpeg.
+ */
+function yieldToGateway(child: ChildProcessWithoutNullStreams): ChildProcessWithoutNullStreams {
+  try { if (child.pid !== undefined) setPriority(child.pid, 10); }
+  catch { /* Priority is best effort: the child may already have exited. */ }
+  return child;
 }
 
 /** Start the JPEG extractor that retains a fresh image from the shared camera source. */
 function spawnSnapshotExtractor(codec: VideoCodec): ChildProcessWithoutNullStreams {
-  return spawn("ffmpeg", [
+  return yieldToGateway(spawn("ffmpeg", [
     "-hide_banner",
     "-loglevel",
     "error",
+
+    // A snapshot every two seconds never needs the frames between keyframes.
+    "-skip_frame",
+    "nokey",
     "-f",
     codec === "h265" ? "hevc" : "h264",
     "-i",
@@ -1787,7 +1802,7 @@ function spawnSnapshotExtractor(codec: VideoCodec): ChildProcessWithoutNullStrea
     "-vcodec",
     "mjpeg",
     "pipe:1",
-  ]);
+  ]));
 }
 
 /** Remux checked elementary streams, optionally retaining recorded frame timing. Aborting terminates the owned FFmpeg process. */
