@@ -958,7 +958,11 @@ export class NvrRtcSession {
     }
     const key = `${result.channel}:${result.sequence}`;
     if (this.#reorder.has(key)) return;
-    if (this.#reorder.size >= 16 || this.#reorderBytes + result.frame.length > 8 * 1024 * 1024) throw new NvrTrialError("framing", "frame_reorder_limit");
+    if (this.#reorderFull(result.frame.length)) {
+      const [oldest] = this.#reorder.values();
+      if (oldest) this.#skipGap(oldest.channel);
+      if (this.#reorderFull(result.frame.length)) throw new NvrTrialError("framing", "frame_reorder_limit");
+    }
     this.#reorder.set(key, { channel: result.channel, sequence: result.sequence, frame: result.frame, at: this.#now() });
     this.#reorderBytes += result.frame.length; this.#drain();
   }
@@ -975,8 +979,24 @@ export class NvrRtcSession {
     // Arrival order can place a repaired predecessor after an older waiter.
     // Drain every ready frame before deciding whether a gap still exists.
     for (const item of this.#reorder.values()) {
-      if (this.#now() - item.at >= 1000) throw new NvrTrialError("framing", "frame_reorder_timeout");
+      const heard = this.#reassembler.lastHeard(item.channel) ?? item.at;
+      if (heard - item.at >= 1000) { this.#skipGap(item.channel); return; }
     }
+  }
+
+  #reorderFull(incomingBytes: number): boolean {
+    return this.#reorder.size >= 16 || this.#reorderBytes + incomingBytes > 8 * 1024 * 1024;
+  }
+
+  /** Resume from the oldest waiter. Video freezes until the next keyframe rebuilds its startup. */
+  #skipGap(channel: number): void {
+    const previous = this.#lastSequence.get(channel) ?? 0;
+    const waiting = [...this.#reorder.values()].filter(item => item.channel === channel);
+    const distance = (sequence: number): number => (sequence - previous + 65536) % 65536;
+    const oldest = waiting.reduce((best, item) => distance(item.sequence) < distance(best.sequence) ? item : best);
+    this.#lastSequence.set(channel, (oldest.sequence + 65535) % 65536);
+    this.stats.applicationSequenceRecoveries++;
+    this.#drain();
   }
 
   #frame(bytes: Buffer, transportChannel: number): void {
