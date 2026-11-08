@@ -831,7 +831,7 @@ export class NvrRtcSession {
           let keys = "";
           try {
             const body = JSON.parse(String(inner.data)) as Record<string, unknown>; status = body.status ?? "none"; format = body.format ?? "none";
-            if (inner.dataType !== "info") keys = ` outer_keys=${Object.keys(outer).sort().join(",")} inner_keys=${Object.keys(inner).sort().join(",")} data_keys=${Object.keys(body).sort().join(",")} is_response=${inner.isResponse}`;
+            if (inner.dataType !== "info") keys = ` account_echo=${body.account === undefined ? "none" : body.account === this.#callAccount}` + ` outer_keys=${Object.keys(outer).sort().join(",")} inner_keys=${Object.keys(inner).sort().join(",")} data_keys=${Object.keys(body).sort().join(",")} is_response=${inner.isResponse}`;
           } catch { /* Not JSON. */ }
           this.#diag("msg", `action=${inner.action} code=${inner.code} type=${typeof inner.dataType === "string" ? inner.dataType.slice(0, 24) : "none"} status=${typeof status === "number" ? status : "none"} format=${typeof format === "string" ? format.slice(0, 16) : "none"} session_match=${inner.sessionId === this.options.context.sign} retired=${this.#retired}${keys}`);
         } catch { this.#diag("msg", "unparsed=true"); }
@@ -957,9 +957,15 @@ export class NvrRtcSession {
     this.#socket.send(this.#envelope(value, join));
   }
 
+  // RESEARCH ONLY: the call's own timestamp, so a hang-up can repeat it when the flag file is present.
+  #callTs: number | null = null;
+  #callAccount = "";
   #cameraMessage(kind: string, value: Record<string, unknown>): Record<string, unknown> {
-    const ts = Math.floor(Date.now() / 1000);
+    const reuse = kind === "hangup" && this.#callTs !== null && existsSync("/tmp/nca-sameacct");
+    const ts = reuse ? this.#callTs! : Math.floor(Date.now() / 1000);
     const account = createHash("md5").update(`0${this.options.administrator}${ts}`).digest("hex");
+    if (kind === "call") { this.#callTs = ts; this.#callAccount = account; }
+    if (kind === "hangup") this.#diag("hangup_account", `reused_call_ts=${reuse}`);
     return { code: 200, action: 3, sessionId: this.options.context.sign, sn: this.options.station,
       subSn: "", channelId: 0, isResponse: 0, dataType: kind, source: "WEB", ts,
       data: JSON.stringify({ timestamp: ts, account, ...value }) };
