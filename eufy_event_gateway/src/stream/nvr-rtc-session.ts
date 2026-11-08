@@ -828,8 +828,12 @@ export class NvrRtcSession {
           const outer = JSON.parse(data.toString()) as Record<string, unknown>;
           const inner = JSON.parse(String(outer.data)) as Record<string, unknown>;
           let status: unknown = "none", format: unknown = "none";
-          try { const body = JSON.parse(String(inner.data)) as Record<string, unknown>; status = body.status ?? "none"; format = body.format ?? "none"; } catch { /* Not JSON. */ }
-          this.#diag("msg", `action=${inner.action} code=${inner.code} type=${typeof inner.dataType === "string" ? inner.dataType.slice(0, 24) : "none"} status=${typeof status === "number" ? status : "none"} format=${typeof format === "string" ? format.slice(0, 16) : "none"} session_match=${inner.sessionId === this.options.context.sign} retired=${this.#retired}`);
+          let keys = "";
+          try {
+            const body = JSON.parse(String(inner.data)) as Record<string, unknown>; status = body.status ?? "none"; format = body.format ?? "none";
+            if (inner.dataType !== "info") keys = ` outer_keys=${Object.keys(outer).sort().join(",")} inner_keys=${Object.keys(inner).sort().join(",")} data_keys=${Object.keys(body).sort().join(",")} is_response=${inner.isResponse}`;
+          } catch { /* Not JSON. */ }
+          this.#diag("msg", `action=${inner.action} code=${inner.code} type=${typeof inner.dataType === "string" ? inner.dataType.slice(0, 24) : "none"} status=${typeof status === "number" ? status : "none"} format=${typeof format === "string" ? format.slice(0, 16) : "none"} session_match=${inner.sessionId === this.options.context.sign} retired=${this.#retired}${keys}`);
         } catch { this.#diag("msg", "unparsed=true"); }
         if (this.#retired) return;
         if (++this.#operations > 32) { this.#fail("negotiation", "signalling_queue_limit"); return; }
