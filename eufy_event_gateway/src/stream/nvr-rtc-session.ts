@@ -982,6 +982,16 @@ export class NvrRtcSession {
       if (this.#authenticated || inner.code !== 200) throw new NvrTrialError("join");
       this.#authenticated = true; this.#stage = "call"; this.#action("call", {});
 
+      // RESEARCH ONLY: with the flag file present, send the call again every 4 s until the NVR answers it.
+      if (existsSync("/tmp/nca-recall")) {
+        let sent = 1;
+        const again = setInterval(() => {
+          if (this.#retired || this.#accepted || sent >= 7 || this.#socket?.readyState !== WebSocket.OPEN) { clearInterval(again); return; }
+          try { this.#action("call", {}); sent++; this.#diag("recall", `attempt=${sent}`); } catch { clearInterval(again); }
+        }, 4_000);
+        again.unref();
+      }
+
       // RESEARCH ONLY: with the flag file present, keep the signalling socket alive with the general route's action-2 ping.
       if (existsSync("/tmp/nca-ping")) {
         const ping = setInterval(() => {
@@ -1004,6 +1014,7 @@ export class NvrRtcSession {
       if (data.status === 408) throw new NvrTrialError("call", "call_timeout");
       if (data.status === 100) {
         const rows = Array.isArray(data.turn) ? data.turn : [data.turn];
+        if (this.#turn.length && existsSync("/tmp/nca-recall")) return;
         if (rows.length > 4 || this.#turn.length) throw new NvrTrialError("negotiation", "relay_count");
         for (const row of rows) {
           if (!nvrRecord(row)) throw new NvrTrialError("negotiation", "relay_shape");
