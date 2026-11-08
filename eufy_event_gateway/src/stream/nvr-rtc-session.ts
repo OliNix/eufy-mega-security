@@ -10,6 +10,7 @@
 import { observeRawPeer, observeRawDataChannel } from "../diagnostics/raw-rtc.js";
 import { observeRawSocket } from "../diagnostics/raw-network.js";
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import WebSocket from "ws";
 import type { Socket } from "node:dgram";
@@ -1068,7 +1069,7 @@ export class NvrRtcSession {
       this.#markTiming("channelOpen");
       try {
         this.#guard(); channel.send(nvrHeartbeat());
-        this.#heartbeat = setInterval(() => { try { this.#guard(); channel.send(nvrHeartbeat()); } catch { this.#fail("channel"); } }, 10_000);
+        this.#heartbeat = setInterval(() => { this.#diag("tick", `packets=${this.stats.packets} video=${this.stats.video} socket=${diagState(this.#socket)} peer=${this.#peer?.connectionState ?? "none"}`); try { this.#guard(); channel.send(nvrHeartbeat()); } catch { this.#fail("channel"); } }, 10_000);
         this.#sweep = setInterval(() => {
           try { this.#guard(); this.#reassembler.expire(this.#now()); this.#drain(); }
           catch (error) { this.#fail(error instanceof NvrTrialError ? error.stage : "framing", error instanceof NvrTrialError ? error.reason : "unspecified"); }
@@ -1108,6 +1109,7 @@ export class NvrRtcSession {
 
   #packet(packet: Buffer): void {
     this.stats.packets++;
+    if (this.options.modeObserver) this.#diag("obs_rx", `bytes=${packet.length} echo=${packet.equals(HEARTBEAT_ECHO)}`);
 
     // Exact heartbeat echoes carry no camera identity and may arrive on any channel.
     if (packet.equals(HEARTBEAT_ECHO)) { this.stats.controlPackets++; return; }
@@ -1265,6 +1267,17 @@ export class NvrRtcSession {
         const startup = this.#cache.startup;
         if (!startup) return;
         this.#bootstrapped = true;
+
+        // RESEARCH ONLY: with the flag file present, send the call's hangup 15 s into the view and keep the peer open.
+        if (!this.options.modeObserver && this.#maximumLifetimeMilliseconds === null && existsSync("/tmp/nca-midhangup")) {
+          setTimeout(() => {
+            const socket = this.#socket;
+            if (!this.#retired && this.#authenticated && socket?.readyState === WebSocket.OPEN) {
+              socket.send(this.#envelope(this.#cameraMessage("hangup", {})));
+              this.#diag("midhangup", `sent=true packets=${this.stats.packets} video=${this.stats.video}`);
+            } else this.#diag("midhangup", `sent=false socket=${diagState(socket)}`);
+          }, 15_000).unref();
+        }
         if (this.#firstFrame) clearTimeout(this.#firstFrame);
         this.#markTiming("firstVideo");
         markSourceTime(startup, Number(video.timestamp));
