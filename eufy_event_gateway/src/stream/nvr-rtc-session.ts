@@ -974,8 +974,20 @@ export class NvrRtcSession {
     const outer = nvrJson(raw), inner = nvrJson(outer.data);
     if (inner.action === 1) {
       if (this.#authenticated || inner.code !== 200) throw new NvrTrialError("join");
-      this.#authenticated = true; this.#stage = "call"; this.#action("call", {}); return;
+      this.#authenticated = true; this.#stage = "call"; this.#action("call", {});
+
+      // RESEARCH ONLY: with the flag file present, keep the signalling socket alive with the general route's action-2 ping.
+      if (existsSync("/tmp/nca-ping")) {
+        const ping = setInterval(() => {
+          if (this.#retired || this.#socket?.readyState !== WebSocket.OPEN) { clearInterval(ping); return; }
+          try { this.#send({ action: 2, data: JSON.stringify({ source: "WEB" }), code: 200 }, true); this.#diag("ping", "sent=true"); }
+          catch { this.#diag("ping", "sent=false"); }
+        }, 30_000);
+        ping.unref();
+      }
+      return;
     }
+    if (inner.action === 2) return;
     if (!this.#authenticated || inner.action !== 3) throw new NvrTrialError("call", "call_unexpected_action");
     if (inner.sessionId !== this.options.context.sign) throw new NvrTrialError("negotiation", "session_mismatch");
     if (inner.sn !== this.options.station) throw new NvrTrialError("negotiation", "station_mismatch");
