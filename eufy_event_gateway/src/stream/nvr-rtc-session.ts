@@ -28,9 +28,15 @@ import { NvrTrialError, nvrAudio, nvrAudioChannel, nvrCameraPowerCommand, nvrGua
 
 import { NvrLiveControlError } from "../provider/nvr-live-controls.js";
 import { nvrEffectiveModeBroadcast, type NvrEffectiveModeObservation } from "./nvr-effective-mode.js";
+import { createLogger } from "../logging.js";
 import { nvrLiveCommand, nvrLiveJson, nvrLiveReceipt, nvrLivePanReply, nvrLiveSettings, type NvrLiveSettings, type NvrLiveWrite } from "./nvr-live-control-protocol.js";
 
 const HEARTBEAT_ECHO = nvrHeartbeat();
+
+// RESEARCH ONLY (nvr-call-diag): content-free per-session lifecycle lines. Never in a PR branch.
+const diag = createLogger("nvr_diag");
+let diagSessions = 0;
+const diagState = (socket: WebSocket | null): string => socket === null ? "none" : ["connecting", "open", "closing", "closed"][socket.readyState] ?? "unknown";
 const NVR_RECEIVE_BUFFER_BYTES = 4 * 1024 * 1024;
 const XZYH = Buffer.from("XZYH");
 
@@ -349,6 +355,15 @@ export class NvrRtcSession {
   #videoProgressTimer: NodeJS.Timeout | null = null;
   #videoProgressExpiresAt: number | null = null;
   readonly #externalAbort: () => void;
+  readonly #diagId = ++diagSessions;
+  readonly #diagBorn = performance.now();
+  #diagFailed = false;
+  #diag(event: string, detail = ""): void {
+    try {
+      const role = this.options.modeObserver ? "observer" : this.#maximumLifetimeMilliseconds === null ? "live" : "finite";
+      diag.info(`nvr_diag_${event}`, `id=${this.#diagId} role=${role} ms=${Math.round(performance.now() - this.#diagBorn)}${detail ? " " + detail : ""}`);
+    } catch { /* Diagnostics only. */ }
+  }
 
   constructor(private options: NvrRtcOptions, private readonly dependencies: NvrRtcDependencies = {
     socket: (url, protocols, settings) => new WebSocket(url, protocols, settings),
@@ -785,6 +800,7 @@ export class NvrRtcSession {
     }
     const ready = new Promise<void>((resolve, reject) => { this.#readyResolve = resolve; this.#readyReject = reject; });
     const timer = setTimeout(() => this.#fail(this.#stage), 30_000);
+    this.#diag("open", `sign=${createHash("sha256").update(this.options.context.sign).digest("hex").slice(0, 8)} region=${this.options.context.region} ch=${this.options.channel} sensor=${this.options.sensor ?? "none"}`);
     try {
       this.#socket = this.dependencies.socket(`wss://${this.options.context.host}/v1/rtc/ws/join?reqtype=nvr`, ["v1",
         Buffer.from(JSON.stringify({ region: this.options.context.region, type: "NVR", sn: this.options.station,
@@ -792,18 +808,28 @@ export class NvrRtcSession {
           appName: "eufy_mega", modelType: "WEB" })).toString("base64url")],
       { headers: { Origin: "https://security.eufy.com" }, maxPayload: 65536, followRedirects: false, handshakeTimeout: 10_000 });
       this.#socket.on("open", () => {
+        this.#diag("socket_open");
         if (this.#retired) return;
         try { this.#send({ code: 200, action: 1, data: this.options.context.sign, sn: this.options.station,
           source: "WEB", ts: Math.floor(Date.now() / 1000) }, true); } catch { this.#fail("join"); }
       });
       this.#socket.on("error", () => {
+        this.#diag("socket_error", `retired=${this.#retired}`);
         if (!this.#canRetireSignalling()) this.#fail(this.#stage, "signalling_error");
       });
-      this.#socket.on("close", () => {
+      this.#socket.on("close", (code: number, reason: Buffer) => {
+        this.#diag("socket_close", `code=${code} reason_bytes=${reason?.length ?? 0} retired=${this.#retired} closing=${this.#closing !== null} start_sent=${this.#startSent} bootstrapped=${this.#bootstrapped}`);
         if (!this.#retired && !this.#canRetireSignalling()) this.#fail(this.#stage, "signalling_closed");
       });
       observeRawSocket(this.#socket, "nvr_rtc_signal", "ws");
       this.#socket.on("message", data => {
+        try {
+          const outer = JSON.parse(data.toString()) as Record<string, unknown>;
+          const inner = JSON.parse(String(outer.data)) as Record<string, unknown>;
+          let status: unknown = "none", format: unknown = "none";
+          try { const body = JSON.parse(String(inner.data)) as Record<string, unknown>; status = body.status ?? "none"; format = body.format ?? "none"; } catch { /* Not JSON. */ }
+          this.#diag("msg", `action=${inner.action} code=${inner.code} type=${typeof inner.dataType === "string" ? inner.dataType.slice(0, 24) : "none"} status=${typeof status === "number" ? status : "none"} format=${typeof format === "string" ? format.slice(0, 16) : "none"} session_match=${inner.sessionId === this.options.context.sign} retired=${this.#retired}`);
+        } catch { this.#diag("msg", "unparsed=true"); }
         if (this.#retired) return;
         if (++this.#operations > 32) { this.#fail("negotiation", "signalling_queue_limit"); return; }
         this.#chain = this.#chain.then(async () => { if (!this.#retired) await this.#message(data.toString()); })
@@ -830,6 +856,7 @@ export class NvrRtcSession {
       try { this.options.onTimings?.(this.timings); } catch { /* Diagnostics must never prevent retirement. */ }
     }
     if (this.#closing) return this.#closing;
+    this.#diag("close_begin", `authenticated=${this.#authenticated} accepted=${this.#accepted} answer_sent=${this.#answerSent} start_sent=${this.#startSent} socket=${diagState(this.#socket)} channel=${this.#channels.get("WebrtcDataChannel")?.readyState ?? "none"} peer=${this.#peer?.connectionState ?? "none"} packets=${this.stats.packets}`);
     this.#livePending?.reject(new NvrLiveControlError("outcome_unknown", "dispatch"));
     this.#retired = true;
     if (this.#modeObserved) {
@@ -854,6 +881,7 @@ export class NvrRtcSession {
         try { await this.#request(1004, 1500, true); } catch { this.stats.stopUnconfirmed++; }
       } else if (this.#startSent) this.stats.stopUnconfirmed++;
       const socket = this.#socket;
+      if (!socket || socket.readyState === WebSocket.CLOSED) this.#diag("hangup", `sent=false authenticated=${this.#authenticated} socket=${diagState(socket)}`);
       if (socket && socket.readyState !== WebSocket.CLOSED) {
         socket.removeAllListeners("message");
         await new Promise<void>(resolve => {
@@ -862,7 +890,8 @@ export class NvrRtcSession {
           socket.once("close", finished);
           try {
             // Without a hangup the NVR holds the call for about 25 s, and a third held call goes unanswered.
-            if (this.#authenticated && socket.readyState === WebSocket.OPEN) socket.send(this.#envelope(this.#cameraMessage("hangup", {})));
+            if (this.#authenticated && socket.readyState === WebSocket.OPEN) { socket.send(this.#envelope(this.#cameraMessage("hangup", {}))); this.#diag("hangup", "sent=true"); }
+            else this.#diag("hangup", `sent=false authenticated=${this.#authenticated} socket=${diagState(socket)}`);
 
             // A close handshake lets the queued hangup flush before retirement.
             socket.close();
@@ -881,6 +910,7 @@ export class NvrRtcSession {
       this.#pendingCandidates.length = 0; this.#localCandidates.clear(); this.#turn.length = 0;
       this.output.end();
       this.#audioOutput.end();
+      this.#diag("closed", `stop_unconfirmed=${this.stats.stopUnconfirmed} peer=${this.#peer?.connectionState ?? "none"}`);
     })();
     return this.#closing;
   }
@@ -901,6 +931,7 @@ export class NvrRtcSession {
 
   #fail(stage: NvrTrialStage, reason: NvrTrialReason = "unspecified"): void {
     if (this.#retired) return;
+    if (!this.#diagFailed) { this.#diagFailed = true; this.#diag("fail", `stage=${stage} reason=${reason} socket=${diagState(this.#socket)}`); }
     this.#stage = stage;
     const error = new NvrTrialError(stage, reason);
     this.#readyReject?.(error);
@@ -977,6 +1008,8 @@ export class NvrRtcSession {
       try { peer = this.#peer = this.dependencies.peer(this.#turn);
         observeRawPeer(peer, { station: this.options.station, camera: this.options.camera }); }
       catch { throw new NvrTrialError("negotiation", "peer_setup"); }
+      peer.iceConnectionStateChange.subscribe(state => this.#diag("ice_state", `state=${state}`));
+      peer.connectionStateChange.subscribe(state => this.#diag("peer_state", `state=${state}`));
       peer.connectionStateChange.subscribe(state => { if (state === "failed" || state === "disconnected") this.#fail("negotiation", state === "failed" ? "peer_failed" : "peer_disconnected"); });
       peer.onIceCandidate.subscribe(candidate => {
         if (!candidate?.candidate || this.#retired) return;
@@ -1043,7 +1076,7 @@ export class NvrRtcSession {
         this.#readyResolve?.(); this.#readyResolve = null; this.#readyReject = null;
       } catch { this.#fail("channel"); }
     };
-    channel.onclose = () => { if (!this.#retired) this.#fail("channel"); };
+    channel.onclose = () => { this.#diag("channel_close", `label=${channel.label} retired=${this.#retired}`); if (!this.#retired) this.#fail("channel"); };
     observeRawDataChannel(channel, { station: this.options.station, camera: this.options.camera });
     channel.onmessage = event => {
       if (this.#retired && this.#pending?.command !== 1004) return;
