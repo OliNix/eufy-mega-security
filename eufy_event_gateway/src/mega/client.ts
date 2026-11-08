@@ -926,7 +926,9 @@ export class MegaClient {
     const pending = this.#enqueue(async lifetime => {
       const signal = AbortSignal.any([lifetime, deadline]); signal.throwIfAborted();
       try {
-        const selected = region === "auto" ? await discoverNvrServiceRegion(this.#fetch, this.#country, signal) : region;
+        // RESEARCH ONLY: with the flag file present, use the EU signalling host that v0.1.241 chose from the session domain.
+        const selected = (await import("node:fs")).existsSync("/tmp/nca-eu") ? "eu"
+          : region === "auto" ? await discoverNvrServiceRegion(this.#fetch, this.#country, signal) : region;
         signal.throwIfAborted();
         if (this.#session !== session) throw new NvrTrialError("cancelled");
         const host = selected === "us" ? "security-smart.eufylife.com" : `security-smart-${selected}.eufylife.com`;
