@@ -1073,7 +1073,7 @@ export class NvrRtcSession {
       this.#markTiming("channelOpen");
       try {
         this.#guard(); channel.send(nvrHeartbeat());
-        this.#heartbeat = setInterval(() => { this.#diag("tick", `packets=${this.stats.packets} video=${this.stats.video} socket=${diagState(this.#socket)} peer=${this.#peer?.connectionState ?? "none"}`); try { this.#guard(); channel.send(nvrHeartbeat()); } catch { this.#fail("channel"); } }, 10_000);
+        this.#heartbeat = setInterval(() => { this.#diag("tick", `packets=${this.stats.packets} video=${this.stats.video} socket=${diagState(this.#socket)} peer=${this.#peer?.connectionState ?? "none"}`); this.#observerMidHangup(); try { this.#guard(); channel.send(nvrHeartbeat()); } catch { this.#fail("channel"); } }, 10_000);
         this.#sweep = setInterval(() => {
           try { this.#guard(); this.#reassembler.expire(this.#now()); this.#drain(); }
           catch (error) { this.#fail(error instanceof NvrTrialError ? error.stage : "framing", error instanceof NvrTrialError ? error.reason : "unspecified"); }
@@ -1109,6 +1109,18 @@ export class NvrRtcSession {
     const now = Math.floor(performance.now());
     if (now < this.#lastNow) throw new NvrTrialError("framing", "clock_reversed");
     this.#lastNow = now; return now;
+  }
+
+  // RESEARCH ONLY: with the flag file present, the observer sends its hangup once, at a heartbeat, and keeps its peer open.
+  #observerHungUp = false;
+  #observerMidHangup(): void {
+    if (!this.options.modeObserver || this.#observerHungUp || !existsSync("/tmp/nca-obs-midhangup")) return;
+    const socket = this.#socket;
+    this.#observerHungUp = true;
+    if (!this.#retired && this.#authenticated && socket?.readyState === WebSocket.OPEN) {
+      socket.send(this.#envelope(this.#cameraMessage("hangup", {})));
+      this.#diag("obs_midhangup", `sent=true packets=${this.stats.packets}`);
+    } else this.#diag("obs_midhangup", `sent=false socket=${diagState(socket)}`);
   }
 
   #packet(packet: Buffer): void {
