@@ -1243,6 +1243,7 @@ export class NvrRtcSession {
     this.stats.frames++;
     const frame = nvrApplication(bytes);
     const mode = nvrEffectiveModeBroadcast(frame, transportChannel);
+    if (mode) this.#diag("mode_broadcast", `current=${this.options.current()} retired=${this.#retired}`);
     if (mode) {
       if (!this.#retired && this.options.current() && this.options.onEffectiveMode) {
         this.#modeObserved = true;
