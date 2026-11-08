@@ -891,6 +891,13 @@ export class NvrRtcSession {
       if (this.#startSent && this.#channels.get("WebrtcDataChannel")?.readyState === "open") {
         try { await this.#request(1004, 1500, true); } catch { this.stats.stopUnconfirmed++; }
       } else if (this.#startSent) this.stats.stopUnconfirmed++;
+
+      // RESEARCH ONLY: with the flag file present, an open call that never started media also sends the stop first.
+      else if (existsSync("/tmp/nca-obsstop") && this.#channels.get("WebrtcDataChannel")?.readyState === "open") {
+        const asked = performance.now();
+        try { await this.#request(1004, 1500, true); this.#diag("idle_stop", `result=receipt after_ms=${Math.round(performance.now() - asked)}`); }
+        catch (error) { this.#diag("idle_stop", `result=${error instanceof NvrTrialError ? error.stage + "/" + error.reason : "error"} after_ms=${Math.round(performance.now() - asked)}`); }
+      }
       const socket = this.#socket;
       if (!socket || socket.readyState === WebSocket.CLOSED) this.#diag("hangup", `sent=false authenticated=${this.#authenticated} socket=${diagState(socket)}`);
       if (socket && socket.readyState !== WebSocket.CLOSED) {
@@ -1409,7 +1416,7 @@ export class NvrRtcSession {
   }
 
   #request(command: 9100 | 1003 | 1004 | 1103, timeout: number, closing = false, strict = false, pictureDeadline?: number): Promise<Record<string, unknown>> {
-    if (this.options.modeObserver && command !== 9100) return Promise.reject(new NvrTrialError("admission"));
+    if (this.options.modeObserver && command !== 9100 && !(closing && command === 1004 && existsSync("/tmp/nca-obsstop"))) return Promise.reject(new NvrTrialError("admission"));
     if (!closing) this.#guard();
     if (this.#pending || this.#livePending || this.#segment >= 254 || this.options.liveControls && command !== 1004 && this.#segment >= 252) return Promise.reject(new NvrTrialError(this.#stage));
     const channel = this.#channels.get("WebrtcDataChannel");
