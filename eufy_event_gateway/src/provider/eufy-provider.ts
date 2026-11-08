@@ -18,6 +18,7 @@ import { classicLockInventory } from "./classic-lock-inventory.js";
 import { ParameterCheckError, parameterCheckLog, type ParameterCheckModel, type ParameterCheckSummary } from "./reported-parameter-check.js";
 import { nvrLiveProfile, NvrLiveControlError, type NvrLiveControl, type NvrLiveControlResult } from "./nvr-live-controls.js";
 import { NvrModeObserver } from "./nvr-mode-observer.js";
+import { existsSync } from "node:fs";
 import type { NvrEffectiveMode, NvrEffectiveModeObservation } from "../stream/nvr-effective-mode.js";
 import type { NvrLiveSettings } from "../stream/nvr-live-control-protocol.js";
 import { InventoryMotionClock, type InventoryMotionOutcome } from "./inventory-motion.js";
@@ -5752,6 +5753,9 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
     if (!this.config.experimentalNvrModeObserver) {
       admission("disabled"); this.#nvrModeObserver.setTarget(null); return;
     }
+
+    // RESEARCH ONLY: with the flag file present, keep the observer off the NVR.
+    if (existsSync("/tmp/nca-noobs")) { admission("unavailable"); this.#nvrModeObserver.setTarget(null); return; }
     if (!this.config.apiAuthenticationConfigured
       || this.#recordingClosing || this.#rtcPreparation.gated || !this.#client.isAuthenticated) {
       admission("unavailable"); this.#nvrModeObserver.setTarget(null); return;
