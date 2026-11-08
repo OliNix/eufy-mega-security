@@ -895,6 +895,24 @@ export class NvrRtcSession {
       if (!socket || socket.readyState === WebSocket.CLOSED) this.#diag("hangup", `sent=false authenticated=${this.#authenticated} socket=${diagState(socket)}`);
       if (socket && socket.readyState !== WebSocket.CLOSED) {
         socket.removeAllListeners("message");
+
+        // RESEARCH ONLY: with the flag file present, send the hangup and listen for 3 s before closing, logging every reply.
+        if (existsSync("/tmp/nca-hangupwait") && this.#authenticated && socket.readyState === WebSocket.OPEN) {
+          const sent = performance.now();
+          const listener = (data: WebSocket.RawData): void => {
+            try {
+              const inner = JSON.parse(String((JSON.parse(data.toString()) as Record<string, unknown>).data)) as Record<string, unknown>;
+              let status: unknown = "none";
+              try { status = (JSON.parse(String(inner.data)) as Record<string, unknown>).status ?? "none"; } catch { /* Not JSON. */ }
+              this.#diag("hangup_reply", `after_ms=${Math.round(performance.now() - sent)} action=${inner.action} type=${typeof inner.dataType === "string" ? inner.dataType.slice(0, 24) : "none"} status=${typeof status === "number" ? status : "none"} session_match=${inner.sessionId === this.options.context.sign}`);
+            } catch { this.#diag("hangup_reply", "unparsed=true"); }
+          };
+          socket.on("message", listener);
+          socket.send(this.#envelope(this.#cameraMessage("hangup", {}))); this.#diag("hangup", "sent=true waiting=true");
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          socket.removeListener("message", listener);
+          this.#authenticated = false;
+        }
         await new Promise<void>(resolve => {
           const finished = (): void => { clearTimeout(terminate); socket.removeListener("close", finished); resolve(); };
           const terminate = setTimeout(() => { socket.terminate(); finished(); }, 500);
