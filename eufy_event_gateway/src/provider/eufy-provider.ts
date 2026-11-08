@@ -96,6 +96,11 @@ const DSK_REFRESH_SKEW_MILLISECONDS = 60_000;
 const NVR_SWITCH_WAIT_MILLISECONDS = 6_000;
 const STATION_REFRESH_DISCONNECT_FAILURES = 4;
 
+// The mode observer stays off the NVR this long after the gateway's last call there,
+// so a person moving between cameras isn't held up by its reconnecting and stepping
+// aside again. It matches the observer's shortest reconnect delay.
+const NVR_OBSERVER_YIELD_MILLISECONDS = 30_000;
+
 /** Return whether a cached PPCS lookup key should be replaced before another session starts. */
 export function dskKeyNeedsRefresh(
   value: { readonly expiresAt: number | null } | null | undefined,
@@ -698,6 +703,11 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
   });
   #nvrModeInventoryAt: number | null = null;
   #nvrModeAdmission: string | null = null;
+
+  // The observed NVR, and how long the observer keeps off it after the gateway's last call there.
+  #nvrModeStation: string | null = null;
+  #nvrObserverYieldUntil = 0;
+  #nvrObserverResume: NodeJS.Timeout | null = null;
   #nvrModePushStartedAt = 0;
   readonly #doorbellTrials = new Map<string, { controller: AbortController; device: MegaInventoryDevice; diagnostic: boolean;
     generation: number; connecting: boolean; retiring: boolean; terminalRetirement: boolean;
@@ -1997,7 +2007,7 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
           controller.abort();
           signal.removeEventListener("abort", abort);
           const owned = this.#nvrTrials.get(serial) === entry;
-          if (owned) this.#nvrTrials.delete(serial);
+          if (owned) { this.#nvrTrials.delete(serial); this.#nvrObserverReturn(entry.station.serial); }
           entry.releasePeer();
           const waiting = this.#streamStarts.get(serial);
 
@@ -2055,6 +2065,8 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
     const binding = this.#nvrSessionBinding(serial, entry);
     let phaseAbort: (() => void) | undefined;
     try {
+      await this.#nvrObserverStandDown(entry.station.serial);
+      if (!binding.current()) throw new NvrTrialError("cancelled");
       const context = await Promise.race([
         this.#client.nvrSignallingContext(entry.station.serial, this.config.experimentalNvrRegion ?? "auto", entry.controller.signal),
         new Promise<never>((_, reject) => { phaseAbort = () => reject(new NvrTrialError("cancelled"));
@@ -4352,6 +4364,8 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
       current();
     }
     this.#nvrModeInventoryAt = null;
+    if (this.#nvrObserverResume) clearTimeout(this.#nvrObserverResume);
+    this.#nvrObserverResume = null;
     for (const controller of this.#motionAborters) controller.abort();
     for (const entry of this.#nvrGuardEntries.values()) {
       if (entry.attempted && !entry.warned) {
@@ -5753,8 +5767,10 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
         && this.#client.isAuthenticated && this.#nvrModeInventoryAt !== null && now >= this.#nvrModeInventoryAt
         && now - this.#nvrModeInventoryAt <= 180_000 && !!child && !!station
         && !inventoryBindingChanged(device, child) && !inventoryBindingChanged(parent, station)
-        && this.#modeObserverBinding(child, station) && !this.#nvrControlReserved(parent.serial);
+        && this.#modeObserverBinding(child, station) && !this.#nvrControlReserved(parent.serial)
+        && !this.#nvrObserverYields(parent.serial);
     };
+    this.#nvrModeStation = parent.serial;
     this.#nvrModeObserver.setTarget({ key: JSON.stringify([generation, this.#nvrBindingKey(device)]), current,
       create: async (signal, active, report) => {
         let abort: (() => void) | undefined;
@@ -6113,6 +6129,37 @@ export class EufyProvider implements CameraProvider, CaptchaProvider {
       if (remaining) this.#generalRtcLockOperations.set(serial, remaining);
       else this.#generalRtcLockOperations.delete(serial);
     }
+  }
+
+  /** True while a gateway call holds this NVR, and for a short while after the last one. */
+  #nvrObserverYields(station: string): boolean {
+    return [...this.#nvrTrials.values()].some(entry => entry.station.serial === station)
+      || performance.now() < this.#nvrObserverYieldUntil;
+  }
+
+  /**
+   * Close the mode observer's call before the gateway calls the same NVR. A
+   * hang-up from one of two calls there can end the other as well, and the NVR
+   * then ignores new calls until the ended one disconnects, which the observer
+   * only noticed when its ICE consent ran out 30 s later.
+   */
+  async #nvrObserverStandDown(station: string): Promise<void> {
+    if (station !== this.#nvrModeStation) return;
+    if (this.#nvrObserverResume) clearTimeout(this.#nvrObserverResume);
+    this.#nvrObserverResume = null;
+    await this.#nvrModeObserver.standDown();
+  }
+
+  /** Let the observer back on once the gateway's calls to its NVR have ended. */
+  #nvrObserverReturn(station: string): void {
+    if (station !== this.#nvrModeStation) return;
+    this.#nvrObserverYieldUntil = performance.now() + NVR_OBSERVER_YIELD_MILLISECONDS;
+    if (this.#nvrObserverResume) clearTimeout(this.#nvrObserverResume);
+    this.#nvrObserverResume = setTimeout(() => {
+      this.#nvrObserverResume = null;
+      if (!this.#nvrObserverYields(station)) this.#nvrModeObserver.resume();
+    }, NVR_OBSERVER_YIELD_MILLISECONDS);
+    this.#nvrObserverResume.unref();
   }
 
   #nvrControlReserved(peer: string): boolean {

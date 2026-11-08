@@ -80,6 +80,33 @@ export class NvrModeObserver {
     });
   }
 
+  /**
+   * Close the connection so another call can use the NVR, keeping the target.
+   * A hang-up from one of two calls there can end the other as well, and the NVR
+   * ignores a new call while a call it ended is still connected, so the two must
+   * not overlap. The provider keeps `current()` false while its call runs.
+   */
+  async standDown(): Promise<void> {
+    if (this.#retry) clearTimeout(this.#retry);
+    this.#retry = null;
+    const attempt = this.#attempt;
+    if (attempt && !attempt.retiring) {
+      attempt.retiring = true;
+      attempt.controller.abort();
+      this.#enqueue(async () => {
+        await this.#retire(attempt);
+        if (!this.#attempt && this.#target === attempt.target) this.#emit("idle");
+      });
+    }
+    await this.#transition;
+  }
+
+  /** Reconnect a stood-down target. Begin still refuses while `current()` is false. */
+  resume(): void {
+    const target = this.#target;
+    if (target && !this.#attempt && !this.#retry && !this.#blocked) this.#enqueue(async () => { this.#begin(target); });
+  }
+
   /** Cancel retry and setup, then wait for this owner's session to finish closing. */
   async close(): Promise<void> {
     this.setTarget(null);

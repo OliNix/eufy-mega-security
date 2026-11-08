@@ -132,3 +132,32 @@ test("an ineligible binding waits for an eligible refresh without a reconnect lo
   f.eligible(false); f.sessions[0]!.output.end(); await tick();
   assert.equal(f.states.at(-1)!.state, "idle"); await f.owner.close();
 });
+
+test("standing down closes the connection without a retry and resume reconnects the same target", async context => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture(); f.owner.setTarget(f.target()); await tick();
+  f.sessions[0]!.report({ mode: 3 });
+  await f.owner.standDown();
+  assert.equal(f.sessions[0]!.closes, 1); assert.deepEqual(f.reports, [{ mode: 3 }, null]);
+  assert.equal(f.states.at(-1)!.state, "idle"); assert.equal(f.owner.active, true);
+  context.mock.timers.tick(300_000); await tick();
+  assert.equal(f.sessions.length, 1);
+  f.owner.resume(); await tick();
+  assert.equal(f.sessions.length, 2); assert.equal(f.sessions[1]!.starts, 1);
+  await f.owner.close();
+});
+
+test("standing down cancels a pending reconnect, and resume waits until the target is current", async context => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture(); f.owner.setTarget(f.target()); await tick();
+  f.sessions[0]!.output.destroy(new Error("PRIVATE_FAILURE")); await tick();
+  assert.equal(f.states.at(-1)!.state, "retrying");
+  f.eligible(false); await f.owner.standDown();
+  context.mock.timers.tick(30_000); await tick();
+  assert.equal(f.sessions.length, 1);
+  f.owner.resume(); await tick();
+  assert.equal(f.sessions.length, 1); assert.equal(f.states.at(-1)!.state, "idle");
+  f.eligible(true); f.owner.resume(); await tick();
+  assert.equal(f.sessions.length, 2);
+  await f.owner.close();
+});
