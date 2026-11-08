@@ -354,15 +354,21 @@ async function shutdown(reason: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info("gateway_stop", `Eufy gateway stopping: ${reason}`);
+  const begun = performance.now();
+  const step = (name: string): void => logger.info("nvr_diag_shutdown", `step=${name} ms=${Math.round(performance.now() - begun)}`);
   startupSnapshots.stop();
   state.close();
   eventImageCapture?.close();
-  await server.close();
-  await streams.close();
-  await provider.close();
+  await server.close(); step("server");
+  await streams.close(); step("streams");
+  await provider.close(); step("provider");
   stopRawRtc();
   await rawHistory?.close();
   setRawHistory(undefined);
+  step("done");
+
+  // RESEARCH ONLY: with the flag file present, give closed peers 2 s to send their last packets before exit.
+  if ((await import("node:fs")).existsSync("/tmp/nca-exitwait")) { await new Promise(resolve => setTimeout(resolve, 2000)); step("waited"); }
 }
 
 process.on("SIGINT", () => void shutdown("sigint").finally(() => process.exit(0)));
